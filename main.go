@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,7 +15,6 @@ import (
 type ServerHealthCheck struct {
 	interval                time.Duration
 	servers                 []string
-	healthCheckResults      sync.Map
 	client                  *http.Client
 	healthCheckEndpoint     string
 	healthCheckEndpointPort string
@@ -26,31 +28,35 @@ type HealthCheckResult struct {
 }
 
 func (hc *ServerHealthCheck) Start() {
+	ticker := time.NewTicker(hc.interval)
+	defer ticker.Stop()
 	for {
 		hc.printServersStatus()
-		time.Sleep(hc.interval)
-		// time.Ticker
+		//time.Sleep(hc.interval)
+		<-ticker.C
 	}
 }
 
 func (hc *ServerHealthCheck) printServersStatus() {
-	var wg *sync.WaitGroup
-	// n, g
-	// for n/g {
-	wg.Add(len(hc.servers))
+	var wg sync.WaitGroup
+	healthCheckResults := make(chan *HealthCheckResult)
 	for _, server := range hc.servers {
+		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			hc.getServerStaus(server)
+			wg.Done()
+			hc.getServerStaus(server, healthCheckResults)
 		}()
 	}
-	wg.Wait()
-	// }
 
-	//print
+	wg.Wait()
+	close(healthCheckResults)
+
+	for result := range healthCheckResults {
+		fmt.Println(result)
+	}
 }
 
-func (hc *ServerHealthCheck) getServerStaus(server string) {
+func (hc *ServerHealthCheck) getServerStaus(server string, healthCheckResults chan *HealthCheckResult) {
 	u := &url.URL{
 		Host:   server + ":" + string(hc.healthCheckEndpointPort),
 		Scheme: "http",
@@ -77,10 +83,16 @@ func (hc *ServerHealthCheck) getServerStaus(server string) {
 		err := fmt.Errorf("error sending healthcheck request for server hostname: %s, err: %v",
 			server, err)
 		log.Println(err)
+		return
 	}
 	defer resp.Body.Close()
 
-	//read resp body
+	//read resp body and discard to free up socket buffer and release connection
+	_, err = io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		err := fmt.Errorf("error discarding the resp body, err: %v", err)
+		log.Println(err)
+	}
 
 	result := &HealthCheckResult{
 		server:  server,
@@ -89,18 +101,24 @@ func (hc *ServerHealthCheck) getServerStaus(server string) {
 		latency: tend.Sub(tStart),
 	}
 
-	hc.healthCheckResults.Store(result, struct{}{})
+	healthCheckResults <- result
 }
 
 func main() {
-	// host1.api.com, host2.api.com:8080
+	// host1.api.com:8081
+	// host2.api.com:8080
 	// read servers from file
+	data, err := os.ReadFile("servers_data")
+	if err != nil {
+		log.Fatalf("unable to read servers file, error: %v", err)
+	}
+	servers := strings.Split(string(data), "\n")
+	//fmt.Printf("... %v, %d", servers, len(servers))
 	timeout := 5 * time.Second
 	client := &http.Client{Timeout: timeout}
 	interval := 5 * time.Minute
 	healthCheckEndpoint := "/healthcheck"
 	port := "8080"
-	servers := []string{}
 	healthCheck := &ServerHealthCheck{interval: interval, servers: servers, client: client,
 		healthCheckEndpoint: healthCheckEndpoint, healthCheckEndpointPort: port}
 	healthCheck.Start()
